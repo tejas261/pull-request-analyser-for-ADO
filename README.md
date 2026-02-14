@@ -7,21 +7,17 @@
 ### 🔍 Features
 
 - **Automatic Diff Fetching**
-
   - Retrieves all changed files in a PR, including before-and-after snapshots.
 
 - **LLM-Powered Reviews**
-
   - Generates best-practice, security, and style feedback using GPT-4.
 
 - **Azure DevOps and Slack Integration**
-
   - Posts inline review comments directly to the PR via the MCP Server endpoints.
 
   - Posts the summary, Best Practices that must be followed, Security issues and Suggestions (if any) to the configured slack channel.
 
 - **Modular Architecture**
-
   - Agents for diff fetching, review generation, and comment posting.
   - Easily extendable by adding new agents or enhancing existing ones.
 
@@ -118,6 +114,10 @@ This will:
 ```
 
 ---
+
+## Architecture Diagram
+
+![PR Analyzer](./assets/architecture-diagram.png)
 
 ## 🔧 Customization & Extensibility
 
