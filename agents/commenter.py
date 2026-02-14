@@ -6,14 +6,17 @@ from langchain_openai import ChatOpenAI
 from langchain_core.messages import HumanMessage
 import os
 
-GPT_MODEL = os.getenv('GPT_MODEL', 'gpt-3.5-turbo')  # Fallback model
+GPT_MODEL = os.getenv('GPT_MODEL', 'gpt-4o-mini')  # Fallback model
 
-async def post_comment(state: dict):
-    tools   = state["tools"]
-    pr_id   = state["pr_id"]
-    repo_id = state["repo_id"]
+async def post_comment(state: dict) -> dict:
+    """Post inline PR comments summarizing code changes with an LLM."""
+    tools = state["tools"]
+    pr_id: int = state["pr_id"]
+    repo_id: str = state["repo_id"]
 
-    add_comment = next(t for t in tools if t.name == "add_pull_request_comment")
+    add_comment = next((t for t in tools if t.name == "add_pull_request_comment"), None)
+    if add_comment is None:
+        raise ValueError("Required tool 'add_pull_request_comment' not available.")
 
     # 1. Post summary comment (unchanged) Not necessary 
     # body = state.get("summary")
@@ -34,10 +37,13 @@ async def post_comment(state: dict):
 
     llm = ChatOpenAI(model=GPT_MODEL, temperature=0.2)
 
+    if not file_changes:
+        return {"status": "No file changes detected; no inline comments posted."}
+
     for file in file_changes:
         path = file["path"]
         before = file["before"].splitlines()
-        after  = file["after"].splitlines()
+        after = file["after"].splitlines()
 
         sm = difflib.SequenceMatcher(None, before, after)
         opcodes = sm.get_opcodes()
@@ -91,7 +97,8 @@ async def post_comment(state: dict):
 
     return {"status": "Summary and valuable LLM-based inline comments posted successfully!"}
 
-def build_commenter_graph():
+def build_commenter_graph() -> StateGraph:
+    """Build the commenter graph that posts inline review comments."""
     g = StateGraph(state_schema=dict)
     g.add_node("post_comment", post_comment)
     g.add_edge(START, "post_comment")

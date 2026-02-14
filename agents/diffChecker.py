@@ -1,23 +1,38 @@
-import json
 import aiohttp
 from langgraph.graph import StateGraph, START, END
-from config import ORG_URL, PROJECT, REPO_NAME, PAT
+from config import ORG_URL, PROJECT, PAT
 
-async def resolve_repo(state: dict):
+
+async def resolve_repo(state: dict) -> dict:
+    """Resolve repository ID from the PR itself to avoid env mismatches.
+
+    Uses Azure DevOps REST API to fetch the pull request and extract the
+    associated repository ID. This is more robust than relying on an env
+    variable for repo name.
+    """
+    pr_id: int = state["pr_id"]
+
+    url = f"{ORG_URL}/{PROJECT}/_apis/git/pullrequests/{pr_id}?api-version=7.1"
+    auth = aiohttp.BasicAuth("", PAT)
+    conn = aiohttp.TCPConnector(ssl=False)
+    async with aiohttp.ClientSession(auth=auth, connector=conn) as sess:
+        async with sess.get(url) as resp:
+            if resp.status == 404:
+                raise ValueError(f"PR '{pr_id}' not found in project '{PROJECT}'")
+            resp.raise_for_status()
+            payload = await resp.json()
+
+    repo = payload.get("repository") or {}
+    repo_id = repo.get("id")
+    if not repo_id:
+        raise ValueError("Unable to resolve repository ID from PR data")
+
+    return {"repo_id": repo_id, "pr_id": pr_id}
+
+async def list_iterations(state: dict) -> dict:
+    """List PR iterations and select the latest iteration."""
+    repo_id = state["repo_id"]
     pr_id = state["pr_id"]
-    tools = state["tools"]
-    list_repos = next(t for t in tools if t.name == "list_repositories")
-    raw = await list_repos.arun({"project": PROJECT})
-    data = json.loads(raw) if isinstance(raw, str) else raw
-
-    repos = data.get("value", []) if isinstance(data, dict) else data
-    match = next((r for r in repos if r.get("name") == REPO_NAME), None)
-    if not match:
-        raise ValueError(f"Repo '{REPO_NAME}' not found in '{PROJECT}'")
-    return {"repo_id": match["id"], "pr_id": pr_id}
-
-async def list_iterations(state: dict):
-    repo_id = state["repo_id"]; pr_id = state["pr_id"]
     url = (
         f"{ORG_URL}/{PROJECT}/_apis/git/repositories/"
         f"{repo_id}/pullRequests/{pr_id}/iterations?api-version=7.1"
@@ -32,14 +47,16 @@ async def list_iterations(state: dict):
     latest_iteration = max(iters, key=lambda i: i["id"])
     return {"latest_iteration": latest_iteration, "repo_id": repo_id, "pr_id": pr_id}
 
-async def get_changes(state: dict):
+async def get_changes(state: dict) -> dict:
+    """Fetch changed file paths and contents for the latest PR iteration."""
     from utils import make_diff  # only for context; actual diffing is done in review
-    repo_id          = state["repo_id"]
-    pr_id            = state["pr_id"]
+
+    repo_id = state["repo_id"]
+    pr_id = state["pr_id"]
     latest_iteration = state["latest_iteration"]
-    iter_id          = latest_iteration["id"]
-    head_commit      = latest_iteration["sourceRefCommit"]["commitId"]
-    base_commit      = latest_iteration["commonRefCommit"]["commitId"]
+    iter_id = latest_iteration["id"]
+    head_commit = latest_iteration["sourceRefCommit"]["commitId"]
+    base_commit = latest_iteration["commonRefCommit"]["commitId"]
 
     auth = aiohttp.BasicAuth("", PAT)
     conn = aiohttp.TCPConnector(ssl=False)
@@ -82,7 +99,7 @@ async def get_changes(state: dict):
         file_changes = []
         for p in paths:
             before = await fetch_content(base_commit, p)
-            after  = await fetch_content(head_commit, p)
+            after = await fetch_content(head_commit, p)
             file_changes.append({"path": p, "before": before, "after": after})
 
     return {
@@ -92,11 +109,12 @@ async def get_changes(state: dict):
         "file_changes": file_changes,
     }
 
-def build_diff_checker_graph():
+def build_diff_checker_graph() -> StateGraph:
+    """Build the diff checker graph that resolves repo and fetches changes."""
     g = StateGraph(state_schema=dict)
-    g.add_node("resolve_repo",    resolve_repo)
+    g.add_node("resolve_repo", resolve_repo)
     g.add_node("list_iterations", list_iterations)
-    g.add_node("get_changes",     get_changes)
+    g.add_node("get_changes", get_changes)
     g.add_edge(START, "resolve_repo")
     g.add_edge("resolve_repo", "list_iterations")
     g.add_edge("list_iterations", "get_changes")

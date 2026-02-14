@@ -1,54 +1,52 @@
 import json
+import aiohttp
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import HumanMessage
 from langgraph.graph import StateGraph, START, END
-from config import PROJECT, REPO_NAME
+from config import PROJECT, ORG_URL, PAT
 from utils import make_diff
 from dotenv import load_dotenv
 import os
 
 load_dotenv(override=True)
 
-GPT_MODEL = os.getenv('GPT_MODEL')
+GPT_MODEL = os.getenv('GPT_MODEL', 'gpt-4o-mini')
 
-async def fetch_pr_details(state: dict):
-    pr_id = state["pr_id"]
-    tools = state["tools"]
-    # find repo id
-    list_repos = next(t for t in tools if t.name == "list_repositories")
-    raw_repos = await list_repos.arun({"project": PROJECT})
-    repos_data = json.loads(raw_repos) if isinstance(raw_repos, str) else raw_repos
-    if isinstance(repos_data, dict):
-        repo_list = repos_data.get("value", [])
-    elif isinstance(repos_data, list):
-        repo_list = repos_data
-    else:
-        raise ValueError(f"Unexpected shape for list_repositories: {type(repos_data)}")
-    repo = next(r for r in repo_list if r["name"] == REPO_NAME)
-    repo_id = repo["id"]
-    # find PR metadata
-    list_prs = next(t for t in tools if t.name == "list_pull_requests")
-    raw_prs  = await list_prs.arun({"project": PROJECT, "repositoryId": repo_id})
-    prs_data = json.loads(raw_prs) if isinstance(raw_prs, str) else raw_prs
-    if isinstance(prs_data, dict):
-        prs_list = prs_data.get("value", [])
-    elif isinstance(prs_data, list):
-        prs_list = prs_data
-    else:
-        raise ValueError(f"Unexpected shape for list_pull_requests: {type(prs_data)}")
-    normalized = [json.loads(i) if isinstance(i, str) else i for i in prs_list]
-    pr = next(p for p in normalized if str(p.get("pullRequestId", p.get("id"))) == str(pr_id))
+async def fetch_pr_details(state: dict) -> dict:
+    """Fetch PR metadata via REST and ensure repo_id is set.
+
+    Avoids relying on MCP tools for listing PRs to prevent StopIteration
+    when PRs are paginated or filtered unexpectedly.
+    """
+    pr_id: int = state["pr_id"]
+
+    url = f"{ORG_URL}/{PROJECT}/_apis/git/pullrequests/{pr_id}?api-version=7.1"
+    auth = aiohttp.BasicAuth("", PAT)
+    conn = aiohttp.TCPConnector(ssl=False)
+    async with aiohttp.ClientSession(auth=auth, connector=conn) as sess:
+        async with sess.get(url) as resp:
+            if resp.status == 404:
+                raise ValueError(f"PR '{pr_id}' not found in project '{PROJECT}'")
+            resp.raise_for_status()
+            pr_data = await resp.json()
+
+    repo = pr_data.get("repository") or {}
+    repo_id = repo.get("id")
+    if not repo_id:
+            raise ValueError("Unable to resolve repository ID from PR data")
+
     return {
-        "pr_data": pr,
+        "pr_data": pr_data,
         "repo_id": repo_id,
         "diff": state.get("diff", ""),
         "pr_id": pr_id,
         "tools": state.get("tools"),
-        "file_changes": state.get("file_changes", [])
+        "file_changes": state.get("file_changes", []),
     }
 
-async def analyze(state: dict):
-    llm           = ChatOpenAI(model=GPT_MODEL, temperature=0.1)
+async def analyze(state: dict) -> dict:
+    """Analyze PR changes using the LLM and produce a markdown summary."""
+    llm = ChatOpenAI(model=GPT_MODEL, temperature=0.1)
     pr_meta       = state["pr_data"]
     diff          = state["diff"]
     file_changes  = state["file_changes"]
@@ -101,10 +99,11 @@ async def analyze(state: dict):
     resp = await llm.ainvoke([HumanMessage(content=prompt)])
     return {"summary": resp.content, "pr_data": pr_meta,}
 
-def build_review_graph():
+def build_review_graph() -> StateGraph:
+    """Build the review graph consisting of metadata fetch and analysis."""
     g = StateGraph(state_schema=dict)
     g.add_node("fetch_pr_details", fetch_pr_details)
-    g.add_node("analyze",          analyze)
+    g.add_node("analyze", analyze)
     g.add_edge(START, "fetch_pr_details")
     g.add_edge("fetch_pr_details", "analyze")
     g.add_edge("analyze", END)

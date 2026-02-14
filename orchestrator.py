@@ -9,15 +9,15 @@ from agents.messenger import build_messenger_graph
 from langchain_mcp_adapters.client import MultiServerMCPClient
 from langchain_mcp_adapters.tools import load_mcp_tools
 
-async def main(pr_id: int):
+async def main(pr_id: int) -> None:
+    """Run the PR analysis workflow and optionally send a Slack summary."""
+    # Initialize the MCP client with the configured servers
     client = MultiServerMCPClient(MCP_CONFIG)
-    async with client.session("azureDevOps") as azure_session, client.session("slack") as slack_session:
+    async with client.session("azureDevOps") as azure_session:
         all_azure_tools = await load_mcp_tools(azure_session)
         pr_tools = [t for t in all_azure_tools if t.name in (
             "list_repositories", "list_pull_requests", "add_pull_request_comment"
         )]
-
-        slack_tools = await load_mcp_tools(slack_session)
 
         # 1. Diff Checker
         diff_app = build_diff_checker_graph().compile()
@@ -46,16 +46,21 @@ async def main(pr_id: int):
         })
         print("=== COMMENT ===\n", comment_out["status"])
 
-        # 4. Messenger (Slack)
-        messenger_app = build_messenger_graph().compile()
-        messenger_out = await messenger_app.ainvoke({
-            "pr_id": pr_id,
-            "repo_id": diff_out["repo_id"],
-            "summary": review_out["summary"],
-            "tools": slack_tools,
-            "pr_data": review_out["pr_data"],
-        })
-        print("=== SLACK ===\n", messenger_out["status"])
+    # 4. Messenger (Slack) - keep Slack session open while invoking tools
+    if "slack" in MCP_CONFIG:
+        async with client.session("slack") as slack_session:
+            slack_tools = await load_mcp_tools(slack_session)
+            messenger_app = build_messenger_graph().compile()
+            messenger_out = await messenger_app.ainvoke({
+                "pr_id": pr_id,
+                "repo_id": diff_out["repo_id"],
+                "summary": review_out["summary"],
+                "tools": slack_tools,
+                "pr_data": review_out["pr_data"],
+            })
+            print("=== SLACK ===\n", messenger_out["status"])
+    else:
+        print("=== SLACK ===\n Skipped (no Slack configuration detected)")
 
 if __name__ == "__main__":
     pr = int(os.getenv("PR_ID", "0"))

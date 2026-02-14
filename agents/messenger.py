@@ -2,11 +2,12 @@ import json
 from langgraph.graph import StateGraph, START, END
 from config import PROJECT, ORG_URL, SLACK_CHANNEL_IDS
 
-async def send_slack_update(state: dict):
-    tools   = state["tools"]
-    pr_id   = state["pr_id"]
-    pr_data = state.get("pr_data", {})
-    summary = state["summary"]
+async def send_slack_update(state: dict) -> dict:
+    """Send a Slack update with PR link, reviewers, and review summary."""
+    tools = state["tools"]
+    pr_id: int = state["pr_id"]
+    pr_data: dict = state.get("pr_data", {})
+    summary: str = state["summary"]
 
     pr_title = pr_data.get("title", "No Title")
     repo_id = state.get("repo_id", "")
@@ -21,25 +22,25 @@ async def send_slack_update(state: dict):
             reviewer_emails.append(email.lower())
 
 
-    get_users_tool = next(t for t in tools if t.name == "slack_get_users")
-    result = await get_users_tool.arun({})
+    # Try to load a users listing tool (optional)
+    get_users_tool = next((t for t in tools if t.name in ("slack_get_users", "get_users", "list_users")), None)
+    users = []
+    if get_users_tool is not None:
+        result = await get_users_tool.arun({})
+        if isinstance(result, str):
+            try:
+                result = json.loads(result)
+            except Exception:
+                users = []
+            else:
+                users = result.get("users", []) if isinstance(result, dict) else result
+        elif isinstance(result, dict):
+            users = result.get("users", [])
+        elif isinstance(result, list):
+            users = result
 
 
-    if isinstance(result, str):
-        try:
-            result = json.loads(result)
-        except Exception:
-            users = []
-        else:
-            users = result.get("users", []) if isinstance(result, dict) else result
-    elif isinstance(result, dict):
-        users = result.get("users", [])
-    elif isinstance(result, list):
-        users = result
-    else:
-        users = []
-
-    print("users", users)
+    # Build email -> Slack ID mapping
 
     email_to_slack = {}
     for u in users:
@@ -69,7 +70,9 @@ async def send_slack_update(state: dict):
         f"*PR Review Summary:*\n{summary}"
     )
 
-    slack_post_message = next(t for t in tools if t.name == "slack_post_message" or t.name == "send_message")
+    slack_post_message = next((t for t in tools if t.name in ("slack_post_message", "post_message", "send_message")), None)
+    if slack_post_message is None:
+        raise ValueError("Slack post message tool not available (slack_post_message/send_message).")
     payload = {
         "channel_id": channel,
         "text": message
@@ -77,7 +80,8 @@ async def send_slack_update(state: dict):
     await slack_post_message.arun(payload)
     return {"status": "Slack message sent successfully!"}
 
-def build_messenger_graph():
+def build_messenger_graph() -> StateGraph:
+    """Build the messenger graph that posts to Slack."""
     g = StateGraph(state_schema=dict)
     g.add_node("send_slack_update", send_slack_update)
     g.add_edge(START, "send_slack_update")
