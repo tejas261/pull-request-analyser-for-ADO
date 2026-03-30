@@ -1,106 +1,59 @@
+"""Commenter agent — posts synthesised review comments via the provider."""
+
+from __future__ import annotations
 from langgraph.graph import StateGraph, START, END
-from config import PROJECT
-import difflib
+from agents.types import ReviewComment
+from utils import format_comment
 
-from langchain_openai import ChatOpenAI
-from langchain_core.messages import HumanMessage
-import os
 
-GPT_MODEL = os.getenv('GPT_MODEL', 'gpt-4o-mini')  # Fallback model
-
-async def post_comment(state: dict) -> dict:
-    """Post inline PR comments summarizing code changes with an LLM."""
-    tools = state["tools"]
+async def post_comments(state: dict) -> dict:
+    """Post inline and summary comments to the PR via the platform provider."""
+    provider = state["provider"]
     pr_id: int = state["pr_id"]
-    repo_id: str = state["repo_id"]
+    review_comments = state.get("review_comments", [])
+    summary = state.get("summary", "")
 
-    add_comment = next((t for t in tools if t.name == "add_pull_request_comment"), None)
-    if add_comment is None:
-        raise ValueError("Required tool 'add_pull_request_comment' not available.")
+    if not review_comments and not summary:
+        return {"status": "No review findings to post."}
 
-    # 1. Post summary comment (unchanged) Not necessary 
-    # body = state.get("summary")
-    # if isinstance(body, str) and body.strip():
-    #     payload = {
-    #         "projectId":     PROJECT,
-    #         "repositoryId":  repo_id,
-    #         "pullRequestId": pr_id,
-    #         "content":       body,
-    #         "status":        "active"
-    #     }
-    #     await add_comment.arun(payload)
+    posted = 0
+    errors = 0
 
-    # 2. Post summarized inline comments using LLM for change summaries
-    file_changes = state.get("file_changes", [])
-    max_comments_per_file = 3            # Limit per file
-    min_hunk_length = 3                  # Minimum number of edited lines to consider
+    # Post individual inline comments
+    for raw in review_comments:
+        comment = ReviewComment.model_validate(raw) if isinstance(raw, dict) else raw
+        body = format_comment(comment)
+        try:
+            await provider.post_review_comment(
+                pr_id=pr_id,
+                body=body,
+                path=comment.file_path or None,
+                line=comment.line_number,
+            )
+            posted += 1
+        except Exception as e:
+            errors += 1
+            print(f"  [warn] Failed to post comment on {comment.file_path}: {e}")
 
-    llm = ChatOpenAI(model=GPT_MODEL, temperature=0.2)
+    # Post the overall summary as a top-level comment
+    if summary:
+        try:
+            await provider.post_review_comment(pr_id=pr_id, body=summary)
+            posted += 1
+        except Exception as e:
+            errors += 1
+            print(f"  [warn] Failed to post summary comment: {e}")
 
-    if not file_changes:
-        return {"status": "No file changes detected; no inline comments posted."}
+    status = f"Posted {posted} comments"
+    if errors:
+        status += f" ({errors} failed)"
+    return {"status": status}
 
-    for file in file_changes:
-        path = file["path"]
-        before = file["before"].splitlines()
-        after = file["after"].splitlines()
-
-        sm = difflib.SequenceMatcher(None, before, after)
-        opcodes = sm.get_opcodes()
-        inlines = []
-
-        for tag, i1, i2, j1, j2 in opcodes:
-            if tag in ("replace", "insert", "delete"):
-                before_block = before[i1:i2]
-                after_block = after[j1:j2]
-                # Skip tiny/insignificant changes (single blank etc)
-                if len(after_block) < min_hunk_length:
-                    if (len(after_block) == 1 and after_block and after_block[0].strip() != ""):
-                        pass
-                    else:
-                        continue
-                # Only summarize if it's not blank
-                summary_lines = [line for line in after_block if line.strip() != ""]
-                if not summary_lines:
-                    continue
-
-                # Compose input for the LLM
-                prompt = (
-                    f"File: {path}\n"
-                    f"Lines {j1+1}-{j2}: summarize the change below for a code reviewer.\n"
-                    f"--- BEFORE ---\n{chr(10).join(before_block)}\n"
-                    f"--- AFTER ---\n{chr(10).join(after_block)}\n"
-                    "Give a concise, clear summary for a code review comment. Only describe what and why, do not repeat the code."
-                )
-
-                resp = await llm.ainvoke([HumanMessage(content=prompt)])
-                inline_comment = {
-                    "filePath":   path,
-                    "lineNumber": j1 + 1,
-                    "content":    resp.content.strip()
-                }
-                inlines.append(inline_comment)
-
-        # Post up to N comments per file
-        inlines = inlines[:max_comments_per_file]
-        for comment in inlines:
-            payload = {
-                "projectId":     PROJECT,
-                "repositoryId":  repo_id,
-                "pullRequestId": pr_id,
-                "content":       comment["content"],
-                "filePath":      comment["filePath"],
-                "lineNumber":    comment["lineNumber"],
-                "status":        "active"
-            }
-            await add_comment.arun(payload)
-
-    return {"status": "Summary and valuable LLM-based inline comments posted successfully!"}
 
 def build_commenter_graph() -> StateGraph:
-    """Build the commenter graph that posts inline review comments."""
+    """Build the commenter graph."""
     g = StateGraph(state_schema=dict)
-    g.add_node("post_comment", post_comment)
-    g.add_edge(START, "post_comment")
-    g.add_edge("post_comment", END)
+    g.add_node("post_comments", post_comments)
+    g.add_edge(START, "post_comments")
+    g.add_edge("post_comments", END)
     return g

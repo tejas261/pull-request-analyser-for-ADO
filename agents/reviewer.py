@@ -1,110 +1,75 @@
-import json
-import aiohttp
-from langchain_openai import ChatOpenAI
-from langchain_core.messages import HumanMessage
+"""Review orchestrator — fans out to specialised reviewers, then synthesises."""
+
+from __future__ import annotations
+import asyncio
 from langgraph.graph import StateGraph, START, END
-from config import PROJECT, ORG_URL, PAT
-from utils import make_diff
-from dotenv import load_dotenv
-import os
 
-load_dotenv(override=True)
+from agents.router import partition_files, classify_file
+from agents.chunker import chunk_file_changes
+from agents.reviewers.security import run_security_review
+from agents.reviewers.best_practices import run_best_practices_review
+from agents.reviewers.test_coverage import run_test_coverage_review
+from agents.reviewers.dependency import run_dependency_review
+from agents.reviewers.pr_description import run_pr_description_review
+from agents.reviewers.synthesizer import synthesize
+from agents.types import ReviewResult
+from utils import count_changed_lines
 
-GPT_MODEL = os.getenv('GPT_MODEL', 'gpt-4o-mini')
 
-async def fetch_pr_details(state: dict) -> dict:
-    """Fetch PR metadata via REST and ensure repo_id is set.
+async def run_all_reviewers(state: dict) -> dict:
+    """Fan-out to all specialised reviewers and collect results."""
+    file_changes = state["file_changes"]
+    pr_metadata = state["pr_metadata"]
 
-    Avoids relying on MCP tools for listing PRs to prevent StopIteration
-    when PRs are paginated or filtered unexpectedly.
-    """
-    pr_id: int = state["pr_id"]
+    groups = partition_files(file_changes)
+    chunks = chunk_file_changes(file_changes)
 
-    url = f"{ORG_URL}/{PROJECT}/_apis/git/pullrequests/{pr_id}?api-version=7.1"
-    auth = aiohttp.BasicAuth("", PAT)
-    conn = aiohttp.TCPConnector(ssl=False)
-    async with aiohttp.ClientSession(auth=auth, connector=conn) as sess:
-        async with sess.get(url) as resp:
-            if resp.status == 404:
-                raise ValueError(f"PR '{pr_id}' not found in project '{PROJECT}'")
-            resp.raise_for_status()
-            pr_data = await resp.json()
+    tasks = []
 
-    repo = pr_data.get("repository") or {}
-    repo_id = repo.get("id")
-    if not repo_id:
-            raise ValueError("Unable to resolve repository ID from PR data")
+    # ── Security review (all files) ──────────────────────────────────
+    for chunk in chunks:
+        tasks.append(run_security_review(chunk, pr_metadata))
+
+    # ── Best-practices review (by file category per chunk) ───────────
+    for chunk in chunks:
+        chunk_groups = partition_files(chunk)
+        for category, cat_files in chunk_groups.items():
+            if category == "dependency":
+                continue  # handled separately
+            tasks.append(
+                run_best_practices_review(cat_files, pr_metadata, category)
+            )
+
+    # ── Test-coverage review (all files) ─────────────────────────────
+    tasks.append(run_test_coverage_review(file_changes, pr_metadata))
+
+    # ── Dependency review (only if dependency files changed) ─────────
+    dep_files = groups.get("dependency", [])
+    if dep_files:
+        tasks.append(run_dependency_review(dep_files, pr_metadata))
+
+    # ── PR description review ────────────────────────────────────────
+    changed_paths = [fc["path"] for fc in file_changes]
+    tasks.append(run_pr_description_review(pr_metadata, changed_paths))
+
+    # Run all in parallel
+    results: list[ReviewResult] = await asyncio.gather(*tasks)
+
+    # ── Synthesise ───────────────────────────────────────────────────
+    total_lines = count_changed_lines(file_changes)
+    filtered_comments, summary_md = synthesize(results, total_lines)
 
     return {
-        "pr_data": pr_data,
-        "repo_id": repo_id,
-        "diff": state.get("diff", ""),
-        "pr_id": pr_id,
-        "tools": state.get("tools"),
-        "file_changes": state.get("file_changes", []),
+        "summary": summary_md,
+        "review_comments": [c.model_dump() for c in filtered_comments],
+        "pr_metadata": pr_metadata,
     }
 
-async def analyze(state: dict) -> dict:
-    """Analyze PR changes using the LLM and produce a markdown summary."""
-    llm = ChatOpenAI(model=GPT_MODEL, temperature=0.1)
-    pr_meta       = state["pr_data"]
-    diff          = state["diff"]
-    file_changes  = state["file_changes"]
-
-    descs = []
-    for ch in file_changes:
-        d = make_diff(ch["before"], ch["after"], ch["path"])
-        excerpt = "\n".join(d.splitlines()[:200])
-        descs.append(f"--- {ch['path']} ---\n{excerpt}\n")
-    all_desc = "\n".join(descs)
-
-    prompt = (
-        "You are a senior frontend engineer with deep expertise in best practices, performance, security, "
-        "and user experience in modern web applications.\n\n"
-        "PR Metadata:\n"
-        f"{json.dumps(pr_meta, indent=2)}\n\n"
-        "Changed Files:\n"
-        "List of file paths that were modified:\n"
-        f"{diff}\n\n"
-        "File Contents:\n"
-        "For each file above, you have the ‘before’ and ‘after’ code blocks.\n"
-        f"{all_desc}\n\n"
-        "TASK:\n"
-        "Please produce a comprehensive Pull Request review that includes:\n"
-        "  1. Summary of Changes:\n"
-        "     – What features or components were added, removed, or refactored?\n"
-        "     – High-level description of the intent behind each change.\n\n"
-        "  2. UI/UX & Layout:\n"
-        "     – Evaluate consistency with established design patterns and visual language.\n"
-        "     – Identify broken layouts, responsiveness issues, or visual regressions.\n"
-        "     – Highlight any UI/UX improvements or inconsistencies (spacing, alignment, interactions).\n\n"
-        "  3. Best Practices & Style:\n"
-        "     – Consistency with existing code style (naming, patterns, formatting).\n"
-        "     – Performance considerations (rendering efficiency, bundle size, hooks usage).\n"
-        "     – Maintainability (separation of concerns, readability, reusability).\n\n"
-        "  4. Security & Accessibility:\n"
-        "     – Potential security vulnerabilities (XSS, injection, insecure dependencies).\n"
-        "     – Accessibility gaps (ARIA attributes, keyboard navigation, color contrast, screen reader support).\n\n"
-        "  5. Test Coverage:\n"
-        "     – Identify missing unit or integration tests for new or modified components.\n"
-        "     – Recommend specific test cases and strategies to improve coverage.\n\n"
-        "  6. Suggestions & References:\n"
-        "     – Provide concrete code snippets or links to relevant documentation and standards.\n\n"
-        "FORMAT:\n"
-        "- Use Markdown with headings for each section.\n"
-        "- Bullet-point feedback under each heading.\n"
-        "- If you reference a specific file or line number, prefix with `File: <path>`.\n\n"
-    )
-
-    resp = await llm.ainvoke([HumanMessage(content=prompt)])
-    return {"summary": resp.content, "pr_data": pr_meta,}
 
 def build_review_graph() -> StateGraph:
-    """Build the review graph consisting of metadata fetch and analysis."""
+    """Build the review graph with fan-out to specialized agents."""
     g = StateGraph(state_schema=dict)
-    g.add_node("fetch_pr_details", fetch_pr_details)
-    g.add_node("analyze", analyze)
-    g.add_edge(START, "fetch_pr_details")
-    g.add_edge("fetch_pr_details", "analyze")
-    g.add_edge("analyze", END)
+    g.add_node("run_all_reviewers", run_all_reviewers)
+    g.add_edge(START, "run_all_reviewers")
+    g.add_edge("run_all_reviewers", END)
     return g

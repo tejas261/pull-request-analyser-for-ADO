@@ -1,122 +1,64 @@
-import aiohttp
+"""Diff checker agent — uses provider abstraction to fetch PR changes."""
+
+from __future__ import annotations
 from langgraph.graph import StateGraph, START, END
-from config import ORG_URL, PROJECT, PAT
 
 
-async def resolve_repo(state: dict) -> dict:
-    """Resolve repository ID from the PR itself to avoid env mismatches.
-
-    Uses Azure DevOps REST API to fetch the pull request and extract the
-    associated repository ID. This is more robust than relying on an env
-    variable for repo name.
-    """
+async def fetch_changes(state: dict) -> dict:
+    """Fetch PR metadata and all file changes via the provider."""
+    provider = state["provider"]
     pr_id: int = state["pr_id"]
 
-    url = f"{ORG_URL}/{PROJECT}/_apis/git/pullrequests/{pr_id}?api-version=7.1"
-    auth = aiohttp.BasicAuth("", PAT)
-    conn = aiohttp.TCPConnector(ssl=False)
-    async with aiohttp.ClientSession(auth=auth, connector=conn) as sess:
-        async with sess.get(url) as resp:
-            if resp.status == 404:
-                raise ValueError(f"PR '{pr_id}' not found in project '{PROJECT}'")
-            resp.raise_for_status()
-            payload = await resp.json()
+    pr_metadata = await provider.get_pr_metadata(pr_id)
+    file_changes = await provider.get_file_changes(pr_id)
 
-    repo = payload.get("repository") or {}
-    repo_id = repo.get("id")
-    if not repo_id:
-        raise ValueError("Unable to resolve repository ID from PR data")
+    # Convert FileChange dataclasses to dicts for downstream agents
+    fc_dicts = [
+        {
+            "path": fc.path,
+            "change_type": fc.change_type,
+            "before": fc.before,
+            "after": fc.after,
+            "old_path": fc.old_path,
+        }
+        for fc in file_changes
+    ]
 
-    return {"repo_id": repo_id, "pr_id": pr_id}
-
-async def list_iterations(state: dict) -> dict:
-    """List PR iterations and select the latest iteration."""
-    repo_id = state["repo_id"]
-    pr_id = state["pr_id"]
-    url = (
-        f"{ORG_URL}/{PROJECT}/_apis/git/repositories/"
-        f"{repo_id}/pullRequests/{pr_id}/iterations?api-version=7.1"
-    )
-    auth = aiohttp.BasicAuth("", PAT)
-    conn = aiohttp.TCPConnector(ssl=False)
-    async with aiohttp.ClientSession(auth=auth, connector=conn) as sess:
-        async with sess.get(url) as resp:
-            resp.raise_for_status()
-            payload = await resp.json()
-    iters = payload.get("value", payload) if isinstance(payload, dict) else payload
-    latest_iteration = max(iters, key=lambda i: i["id"])
-    return {"latest_iteration": latest_iteration, "repo_id": repo_id, "pr_id": pr_id}
-
-async def get_changes(state: dict) -> dict:
-    """Fetch changed file paths and contents for the latest PR iteration."""
-    from utils import make_diff  # only for context; actual diffing is done in review
-
-    repo_id = state["repo_id"]
-    pr_id = state["pr_id"]
-    latest_iteration = state["latest_iteration"]
-    iter_id = latest_iteration["id"]
-    head_commit = latest_iteration["sourceRefCommit"]["commitId"]
-    base_commit = latest_iteration["commonRefCommit"]["commitId"]
-
-    auth = aiohttp.BasicAuth("", PAT)
-    conn = aiohttp.TCPConnector(ssl=False)
-    async with aiohttp.ClientSession(auth=auth, connector=conn) as sess:
-        # list changes
-        changes_url = (
-            f"{ORG_URL}/{PROJECT}/_apis/git/repositories/{repo_id}"
-            f"/pullRequests/{pr_id}/iterations/{iter_id}/changes?api-version=7.1"
+    paths = [fc.path for fc in file_changes]
+    change_summary = []
+    for fc in file_changes:
+        prefix = {"add": "+", "delete": "-", "rename": "~", "edit": "M"}.get(
+            fc.change_type, "?"
         )
-        async with sess.get(changes_url) as resp:
-            resp.raise_for_status()
-            changes = await resp.json()
-        paths = [
-            e["item"]["path"]
-            for e in changes.get("changeEntries", [])
-            if e.get("changeType") in ("edit", "rename")
-        ]
-
-        # fetch content helper
-        async def fetch_content(commit_id: str, path: str) -> str:
-            url = f"{ORG_URL}/{PROJECT}/_apis/git/repositories/{repo_id}/items"
-            params = {
-                "path": path,
-                "includeContent": "true",
-                "resolveLfs": "true",
-                "versionDescriptor.versionType": "commit",
-                "versionDescriptor.version": commit_id,
-                "api-version": "7.1",
-            }
-            async with sess.get(url, params=params) as resp:
-                if resp.status == 404:
-                    return ""
-                resp.raise_for_status()
-                ctype = resp.headers.get("Content-Type", "")
-                if "application/json" in ctype:
-                    data = await resp.json()
-                    return data.get("content", "")
-                return await resp.text()
-
-        file_changes = []
-        for p in paths:
-            before = await fetch_content(base_commit, p)
-            after = await fetch_content(head_commit, p)
-            file_changes.append({"path": p, "before": before, "after": after})
+        label = f"  {prefix} {fc.path}"
+        if fc.old_path:
+            label += f" (from {fc.old_path})"
+        change_summary.append(label)
 
     return {
         "diff": "\n".join(paths),
-        "repo_id": repo_id,
+        "diff_summary": "\n".join(change_summary),
         "pr_id": pr_id,
-        "file_changes": file_changes,
+        "file_changes": fc_dicts,
+        "pr_metadata": {
+            "pr_id": pr_metadata.pr_id,
+            "title": pr_metadata.title,
+            "description": pr_metadata.description,
+            "author": pr_metadata.author,
+            "reviewers": pr_metadata.reviewers,
+            "reviewer_details": pr_metadata.reviewer_details,
+            "source_branch": pr_metadata.source_branch,
+            "target_branch": pr_metadata.target_branch,
+            "url": pr_metadata.url,
+            "raw": pr_metadata.raw,
+        },
     }
 
+
 def build_diff_checker_graph() -> StateGraph:
-    """Build the diff checker graph that resolves repo and fetches changes."""
+    """Build the diff checker graph."""
     g = StateGraph(state_schema=dict)
-    g.add_node("resolve_repo", resolve_repo)
-    g.add_node("list_iterations", list_iterations)
-    g.add_node("get_changes", get_changes)
-    g.add_edge(START, "resolve_repo")
-    g.add_edge("resolve_repo", "list_iterations")
-    g.add_edge("list_iterations", "get_changes")
-    g.add_edge("get_changes", END)
+    g.add_node("fetch_changes", fetch_changes)
+    g.add_edge(START, "fetch_changes")
+    g.add_edge("fetch_changes", END)
     return g

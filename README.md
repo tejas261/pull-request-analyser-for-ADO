@@ -1,165 +1,153 @@
-## AI PR Validator for Frontend repositories in Azure DevOps
+## AI PR Validator — Azure DevOps & GitHub
 
-**AI PR Validator** is an team of AI agents designed to streamline Pull Request (PR) reviews in Azure DevOps for Frontend repositories. It leverages [LangChain](https://python.langchain.com/), [OpenAI GPT-4](https://platform.openai.com/), MCP tools offered by [Tiberriver256](https://github.com/Tiberriver256/mcp-server-azure-devops/tree/main) and custom orchestration agents to fetch PR diffs, analyze code changes, and post insightful review comments back to Azure DevOps.
-
----
-
-### 🔍 Features
-
-- **Automatic Diff Fetching**
-  - Retrieves all changed files in a PR, including before-and-after snapshots.
-
-- **LLM-Powered Reviews**
-  - Generates best-practice, security, and style feedback using GPT-4.
-
-- **Azure DevOps and Slack Integration**
-  - Posts inline review comments directly to the PR via the MCP Server endpoints.
-
-  - Posts the summary, Best Practices that must be followed, Security issues and Suggestions (if any) to the configured slack channel.
-
-- **Modular Architecture**
-  - Agents for diff fetching, review generation, and comment posting.
-  - Easily extendable by adding new agents or enhancing existing ones.
+AI-powered Pull Request reviewer that supports both **Azure DevOps** and **GitHub**. Uses specialised review agents (security, best practices, test coverage, dependency analysis) powered by GPT-4 via LangChain/LangGraph, with optional Slack notifications.
 
 ---
 
-## 🏁 Getting Started
+### Features
 
-Follow these steps to set up and run the AI PR Validator on your machine.
+- **Multi-platform** — Azure DevOps and GitHub PR reviews from the same codebase
+- **Specialised review agents** — Security, best practices (frontend/backend-aware), test coverage, dependency analysis, PR description validation
+- **Severity-graded findings** — Every comment is rated critical/major/minor/nit with confidence scores
+- **Smart scaling** — Comment limits scale with PR size; critical findings are always kept
+- **Full file coverage** — Reviews new files, edits, renames, and deletions (not just edits)
+- **Token-aware chunking** — Large PRs are automatically split into reviewable chunks
+- **Test-to-code mapping** — Flags source file changes missing corresponding test updates
+- **Inline comments** — Posts findings directly on the PR as inline comments
+- **Slack integration** — Sends review summaries with reviewer mentions to Slack
+- **Retry with backoff** — Transient HTTP errors are retried automatically
 
-### 1. Prerequisites
+---
 
-- **Python**: 3.8 or higher
-- **Azure DevOps PAT**: Personal Access Token with `Code (Read & Write)` scope
-- **OpenAI API Key**: For GPT-4 access
-- **Node.js**: Required for MCP server tool (if using)
+### Architecture
 
-### 2. Clone the Repository
-
-**Via HTTP**
-
-```bash
-https://GoFynd@dev.azure.com/GoFynd/Rattle/_git/ai-pr-validator
-cd ai-pr-validator
+```
+                    ┌──────────────┐
+                    │  PR Platform │
+                    │ (ADO/GitHub) │
+                    └──────┬───────┘
+                           │
+              ┌────────────▼─────────────┐
+              │      Provider Layer      │
+              │  ADOProvider / GitHub-   │
+              │  Provider (REST API)     │
+              └────────────┬─────────────┘
+                           │
+              ┌────────────▼─────────────┐
+              │     Diff Checker Agent   │
+              │  Fetch metadata + files  │
+              └────────────┬─────────────┘
+                           │
+              ┌────────────▼─────────────┐
+              │    File Router + Chunker │
+              │  Classify & split files  │
+              └────────────┬─────────────┘
+                           │
+         ┌─────────┬───────┼───────┬──────────┐
+         ▼         ▼       ▼       ▼          ▼
+    ┌─────────┐┌────────┐┌─────┐┌──────┐┌─────────┐
+    │Security ││Best    ││Test ││Dep   ││PR Desc  │
+    │Reviewer ││Practice││Cov  ││Check ││Validate │
+    └────┬────┘└───┬────┘└──┬──┘└──┬───┘└────┬────┘
+         └─────────┴────┬───┴─────┴──────────┘
+                        ▼
+              ┌─────────────────────┐
+              │    Synthesizer      │
+              │ Dedupe + prioritise │
+              └────────┬────────────┘
+                       │
+              ┌────────▼────────┐
+              │   Commenter     │──── Post to PR
+              │   Messenger     │──── Post to Slack
+              └─────────────────┘
 ```
 
-**Via SSH**
+---
+
+### Prerequisites
+
+- Python 3.9+
+- Node.js (for MCP server tools, if using Slack)
+- API keys: OpenAI + platform token (ADO PAT or GitHub token)
+
+### Setup
 
 ```bash
-git@ssh.dev.azure.com:v3/GoFynd/Rattle/ai-pr-validator
-cd ai-pr-validator
-```
-
-### 3. Create & Activate Virtual Environment (Recommended)
-
-```bash
-python3 -m venv .venv
-source .venv/bin/activate   # macOS/Linux
-# .venv\Scripts\activate  # Windows
-```
-
-### 4. Install Dependencies
-
-```bash
+python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
+cp .env.example .env   # edit with your credentials
 ```
 
-### 5. Configuration
+### Configuration
 
-Duplicate the example environment file and update with your credentials:
+Set `PLATFORM=ado` or `PLATFORM=github` in `.env`, then fill in the corresponding credentials. See `.env.example` for all options.
 
-```bash
-cp .env.example .env
-```
-
-Edit `.env` and set the following variables:
-
-```ini
-AZURE_DEVOPS_ORG_URL=https://dev.azure.com/YourOrg
-AZURE_DEVOPS_DEFAULT_PROJECT=YourProject
-AZURE_DEVOPS_DEFAULT_REPO=YourRepo
-AZURE_DEVOPS_PAT=<YOUR_PAT_TOKEN>
-AZURE_DEVOPS_AUTH_METHOD=pat
-OPENAI_API_KEY=<YOUR_OPENAI_KEY>
-PR_ID=<PR_ID_TO_REVIEW>
-GPT_MODEL=<GPT model of your choice>
-```
-
-### 6. Running the Validator
+### Run
 
 ```bash
 python orchestrator.py
 ```
 
-This will:
+### Run Tests
 
-1. Fetch the specified PR diffs.
-2. Generate review comments via GPT-4.
-3. Post comments back to the Azure DevOps PR.
-
----
-
-## 🏗️ Project Structure
-
-```text
-├── agents/
-│   ├── diffChecker.py        # Fetches PR diffs and file contents
-│   ├── reviewer.py          # Generates review comments using LLM
-│   └── commenter.py         # Posts review comments to Azure DevOps
-├── config.py                # Loads environment variables and configs
-├── orchestrator.py          # Main workflow: diff → review → comment
-├── utils.py                 # Helper functions (e.g., diff formatting)
-├── requirements.txt         # Python dependencies
-└── README.md                # Project documentation
+```bash
+python -m pytest tests/ -v
 ```
 
 ---
 
-## Architecture Diagram
+### Project Structure
 
-![PR Analyzer](./assets/architecture-diagram.png)
-
-## 🔧 Customization & Extensibility
-
-- **Add New Agents**: Create a new module in `agents/` following the existing pattern.
-- **Extend Reviewer**: Modify `agents/reviewer.py` to add custom policies, security checks, or style guidelines.
-- **Utility Functions**: Reuse or extend functions in `utils.py` for diff parsing, formatting, or other tasks.
-
----
-
-## 🚀 Deployment & CI Integration
-
-1. **CI Pipeline**: Integrate `python orchestrator.py` into your Azure DevOps YAML pipeline to automate PR reviews on each pull request.
-2. **Docker Support**: Add a `Dockerfile` to containerize the validator for consistent environments.
-
----
-
-## ❓ Troubleshooting
-
-- **Authentication Errors**: Verify your `AZURE_DEVOPS_PAT` and `OPENAI_API_KEY` in `.env`.
-- **Rate Limits**: Monitor OpenAI rate limits; consider batching or reducing prompt sizes.
-- **Network Issues**: Ensure your environment can reach Azure DevOps and OpenAI endpoints.
-
----
-
-## 🤝 Contributing
-
-Contributions are welcome! Please:
-
-1. Fork the repository.
-2. Create a feature branch: `git checkout -b feature/your-feature`
-3. Commit your changes: `git commit -m "Add your feature"`
-4. Push to the branch: `git push origin feature/your-feature`
-5. Open a Pull Request for review.
-
-Please follow the [Contributor Covenant](https://www.contributor-covenant.org/) code of conduct.
+```
+├── orchestrator.py              # Main workflow: diff → review → comment → slack
+├── config.py                    # Env vars, platform selection, MCP config
+├── retry.py                     # Exponential backoff retry decorator
+├── utils.py                     # Diff formatting, comment formatting helpers
+├── providers/
+│   ├── base.py                  # PRProvider abstract interface
+│   ├── ado.py                   # Azure DevOps REST API provider
+│   ├── github.py                # GitHub REST API provider
+│   └── factory.py               # Provider factory (PLATFORM → provider)
+├── agents/
+│   ├── diffChecker.py           # Fetch PR diffs and file contents
+│   ├── reviewer.py              # Fan-out to specialised reviewers
+│   ├── commenter.py             # Post review comments to PR
+│   ├── messenger.py             # Send Slack notification
+│   ├── types.py                 # ReviewComment, ReviewResult models
+│   ├── router.py                # File-type classification & test pairing
+│   ├── chunker.py               # Token-aware PR splitting
+│   └── reviewers/
+│       ├── security.py          # Security vulnerability detection
+│       ├── best_practices.py    # Style, performance, patterns (frontend/backend-aware)
+│       ├── test_coverage.py     # Test gaps + test-to-code mapping
+│       ├── dependency.py        # package.json/requirements.txt analysis
+│       ├── pr_description.py    # PR description quality check
+│       └── synthesizer.py       # Merge, dedupe, prioritise findings
+└── tests/
+    ├── test_utils.py
+    ├── test_router.py
+    ├── test_chunker.py
+    ├── test_synthesizer.py
+    └── test_providers.py
+```
 
 ---
 
-## 📖 Further Reading
+### CI Integration
 
-- [LangChain Documentation](https://python.langchain.com/)
-- [Azure DevOps REST API Reference](https://docs.microsoft.com/rest/api/azure/devops/)
-- [OpenAI API Reference](https://platform.openai.com/docs)
+Add to your Azure DevOps pipeline or GitHub Actions:
 
----
+```yaml
+# GitHub Actions example
+- name: AI PR Review
+  env:
+    PLATFORM: github
+    GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    GITHUB_OWNER: ${{ github.repository_owner }}
+    GITHUB_REPO: ${{ github.event.repository.name }}
+    PR_ID: ${{ github.event.pull_request.number }}
+    OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+  run: |
+    pip install -r requirements.txt
+    python orchestrator.py
+```
